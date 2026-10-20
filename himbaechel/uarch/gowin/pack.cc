@@ -309,8 +309,15 @@ void GowinPacker::pack_buffered_nets(void)
             continue;
         }
         // a BUFG of the design drives the net or buffers it already: no second one in a chain
-        if (gwu.driver_is_buf(ni->driver) ||
-            std::any_of(ni->users.begin(), ni->users.end(), [](const PortRef &u) { return u.cell->type == id_BUFG; })) {
+        bool buffered = gwu.driver_is_buf(ni->driver);
+        // indexed_store iterators have no iterator_traits, so no std::any_of (GCC rejects it)
+        for (auto &usr : ni->users) {
+            if (usr.cell->type == id_BUFG) {
+                buffered = true;
+                break;
+            }
+        }
+        if (buffered) {
             continue;
         }
         if (ni->attrs.count(id_CLOCK) == 0) {
