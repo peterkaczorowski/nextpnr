@@ -41,6 +41,11 @@ struct GowinImpl : HimbaechelAPI
 
     delay_t estimateDelay(WireId src, WireId dst) const override;
 
+    // Asynchronous set/reset timing of flip-flops
+    bool getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const override;
+    TimingPortClass getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const override;
+    TimingClockingInfo getPortClockingInfo(const CellInfo *cell, IdString port, int index) const override;
+
     // Bel bucket functions
     IdString getBelBucketForCellType(IdString cell_type) const override;
 
@@ -1695,6 +1700,42 @@ void GowinImpl::drawBel(std::vector<GraphicElement> &g, GraphicElement::style_t 
         g.push_back(el);
         break;
     }
+}
+
+// The asynchronous CLEAR/PRESET inputs of a flip-flop do not start a timing
+// path through the flip-flop: a combinational CLEAR -> Q arc would chain
+// reset synchronisers and reset distribution into one long, false path.
+// Like the vendor tool, check them against the clock instead (recovery and
+// removal). The chip database has no separate recovery/removal figures, so
+// the setup/hold requirements of the D input are used as an approximation.
+static bool is_async_ff_port(const CellInfo *cell, IdString port)
+{
+    return is_dff(cell) && port.in(id_CLEAR, id_PRESET);
+}
+
+bool GowinImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayQuad &delay) const
+{
+    if (is_async_ff_port(cell, fromPort))
+        return false;
+    return ctx->get_cell_delay_default(cell, fromPort, toPort, delay);
+}
+
+TimingPortClass GowinImpl::getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const
+{
+    if (is_async_ff_port(cell, port)) {
+        clockInfoCount = 0;
+        if (cell->ports.count(id_D))
+            ctx->get_port_timing_class_default(cell, id_D, clockInfoCount);
+        return clockInfoCount > 0 ? TMG_REGISTER_INPUT : TMG_IGNORE;
+    }
+    return ctx->get_port_timing_class_default(cell, port, clockInfoCount);
+}
+
+TimingClockingInfo GowinImpl::getPortClockingInfo(const CellInfo *cell, IdString port, int index) const
+{
+    if (is_async_ff_port(cell, port))
+        return ctx->get_port_clocking_info_default(cell, id_D, index);
+    return ctx->get_port_clocking_info_default(cell, port, index);
 }
 
 delay_t GowinImpl::estimateDelay(WireId src, WireId dst) const
