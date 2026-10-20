@@ -45,6 +45,7 @@ struct GowinPacker
 
     // PLL
     void pack_pll(void);
+    void derive_clock_constraints(void);
 
     // Clocks
     void pack_hclk(void);

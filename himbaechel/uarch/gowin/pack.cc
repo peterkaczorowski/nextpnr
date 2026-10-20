@@ -187,6 +187,145 @@ void GowinPacker::pack_pll(void)
 }
 
 // ===================================
+// Derived clock constraints
+// ===================================
+// Propagate user clock constraints through input/clock buffers, PLLs and
+// clock dividers so that the clock domains the timing analyser sees (the
+// buffered and generated nets) get a target frequency. This runs before
+// packing, while the clock graph is still intact: placing a PLL next to a
+// dedicated pin disconnects its CLKIN port.
+void GowinPacker::derive_clock_constraints(void)
+{
+    log_info("Generating derived timing constraints...\n");
+    auto MHz = [&](delay_t a) { return 1000.0 / ctx->getDelayNS(a); };
+
+    auto param_str = [&](const CellInfo *ci, const char *name, const std::string &def) -> std::string {
+        auto found = ci->params.find(ctx->id(name));
+        if (found == ci->params.end())
+            return def;
+        return found->second.is_string ? found->second.as_string() : std::to_string(found->second.as_int64());
+    };
+    auto param_double = [&](const CellInfo *ci, const char *name, double def) -> double {
+        auto found = ci->params.find(ctx->id(name));
+        if (found == ci->params.end())
+            return def;
+        if (!found->second.is_string)
+            return double(found->second.as_int64());
+        std::string str = found->second.as_string();
+        try {
+            return std::stod(str);
+        } catch (std::exception &) {
+            // A plain Verilog binary constant written as a string
+            if (!str.empty() && str.find_first_not_of("01") == std::string::npos)
+                return double(std::stoll(str, nullptr, 2));
+            log_error("Cannot parse parameter %s='%s' of cell '%s' as a number.\n", name, str.c_str(),
+                      ctx->nameOf(ci));
+        }
+    };
+
+    pool<IdString> user_constrained, changed_nets;
+    for (auto &net : ctx->nets) {
+        if (net.second->clkconstr != nullptr) {
+            user_constrained.insert(net.first);
+            changed_nets.insert(net.first);
+        }
+    }
+
+    auto get_period = [&](CellInfo *ci, IdString port, delay_t &period) {
+        NetInfo *from = ci->getPort(port);
+        if (from == nullptr || from->clkconstr == nullptr)
+            return false;
+        period = from->clkconstr->period.minDelay();
+        return true;
+    };
+
+    // Set the constraint of the net on `port` to the given period, unless the
+    // net already has one (a user constraint always wins)
+    auto set_period = [&](CellInfo *ci, IdString port, double period_ns) {
+        NetInfo *to = ci->getPort(port);
+        if (to == nullptr)
+            return;
+        delay_t period = ctx->getDelayFromNS(period_ns);
+        if (to->clkconstr != nullptr) {
+            if (user_constrained.count(to->name) &&
+                std::abs(to->clkconstr->period.minDelay() - period) > std::max<delay_t>(1, period / 1000))
+                log_warning("    User constraint of %.2f MHz on net %s overrides derived constraint of %.2f MHz.\n",
+                            MHz(to->clkconstr->period.minDelay()), ctx->nameOf(to), MHz(period));
+            return;
+        }
+        to->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint());
+        to->clkconstr->period = DelayPair(period);
+        to->clkconstr->high = DelayPair(period / 2);
+        to->clkconstr->low = DelayPair(period / 2);
+        log_info("    Derived frequency constraint of %.2f MHz for net %s\n", MHz(period), ctx->nameOf(to));
+        changed_nets.insert(to->name);
+    };
+
+    auto derive_rpll = [&](CellInfo *ci) {
+        delay_t period_in;
+        if (!get_period(ci, id_CLKIN, period_in))
+            return;
+        double in_ns = ctx->getDelayNS(period_in);
+        if (param_str(ci, "DYN_IDIV_SEL", "false") != "false" || param_str(ci, "DYN_FBDIV_SEL", "false") != "false" ||
+            param_str(ci, "CLKFB_SEL", "internal") != "internal") {
+            log_warning("    PLL '%s' uses dynamic dividers or external feedback; its output frequencies are not "
+                        "derived, constrain them in the SDC file.\n",
+                        ctx->nameOf(ci));
+            return;
+        }
+        double idiv = param_double(ci, "IDIV_SEL", 0) + 1;
+        double fbdiv = param_double(ci, "FBDIV_SEL", 0) + 1;
+        double clkout_ns = in_ns * idiv / fbdiv;
+        log_info("    Input frequency of PLL '%s' is constrained to %.2f MHz\n", ctx->nameOf(ci), 1000.0 / in_ns);
+
+        double clkout = param_str(ci, "CLKOUT_BYPASS", "false") == "true" ? in_ns : clkout_ns;
+        double clkoutp = param_str(ci, "CLKOUTP_BYPASS", "false") == "true" ? in_ns : clkout_ns;
+        set_period(ci, id_CLKOUT, clkout);
+        set_period(ci, id_CLKOUTP, clkoutp);
+
+        auto divided_source = [&](const char *src_param) {
+            return param_str(ci, src_param, "CLKOUT") == "CLKOUTP" ? clkoutp : clkout;
+        };
+        if (param_str(ci, "CLKOUTD_BYPASS", "false") == "true")
+            set_period(ci, id_CLKOUTD, in_ns);
+        else
+            set_period(ci, id_CLKOUTD, divided_source("CLKOUTD_SRC") * param_double(ci, "DYN_SDIV_SEL", 2));
+        set_period(ci, id_CLKOUTD3, divided_source("CLKOUTD3_SRC") * 3);
+    };
+
+    // Iteration limit avoids hanging on clock loops
+    int iter = 0;
+    const int itermax = 5000;
+    while (!changed_nets.empty() && iter < itermax) {
+        ++iter;
+        pool<IdString> changed_cells;
+        for (auto net : changed_nets)
+            for (auto &user : ctx->nets.at(net)->users)
+                changed_cells.insert(user.cell->name);
+        changed_nets.clear();
+        for (auto cell : changed_cells) {
+            CellInfo *ci = ctx->cells.at(cell).get();
+            delay_t period;
+            if (ci->type.in(id_IBUF, id_TLVDS_IBUF, id_ELVDS_IBUF, id_BUFG, id_BUFS)) {
+                if (get_period(ci, id_I, period))
+                    set_period(ci, id_O, ctx->getDelayNS(period));
+            } else if (ci->type.in(id_DQCE, id_DHCEN)) {
+                if (get_period(ci, id_CLKIN, period))
+                    set_period(ci, id_CLKOUT, ctx->getDelayNS(period));
+            } else if (ci->type == id_rPLL) {
+                derive_rpll(ci);
+            } else if (ci->type == id_CLKDIV) {
+                if (get_period(ci, id_HCLKIN, period))
+                    set_period(ci, id_CLKOUT, ctx->getDelayNS(period) * param_double(ci, "DIV_MODE", 2));
+            } else if (ci->type == id_CLKDIV2) {
+                if (get_period(ci, id_HCLKIN, period))
+                    set_period(ci, id_CLKOUT, ctx->getDelayNS(period) * 2);
+            }
+        }
+    }
+}
+
+// ===================================
 // ADC
 // ===================================
 void GowinPacker::pack_adc(void)
@@ -583,6 +722,7 @@ void GowinPacker::pack_emcu_and_flash(void)
 
 void GowinPacker::run(void)
 {
+    derive_clock_constraints();
     handle_constants();
     pack_iobs();
     ctx->check();
